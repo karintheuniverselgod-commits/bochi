@@ -1,4 +1,3 @@
-import asyncio
 import logging
 
 from telegram import Update
@@ -6,6 +5,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from app import callbacks
+from app.database import MongoDatabase
 from app.keyboards import (
     chapter_list,
     manga_actions_with_url,
@@ -37,14 +37,31 @@ async def callback_router(
 
     chat_id = query.message.chat_id
 
-    parts = (query.data or "").split(":")
+    parts = (
+        query.data or ""
+    ).split(":")
 
     action = parts[0]
-    value = parts[1] if len(parts) > 1 else None
+    value = (
+        parts[1]
+        if len(parts) > 1
+        else None
+    )
 
     store: SessionStore = (
         context.application.bot_data["sessions"]
     )
+
+    database: MongoDatabase = (
+        context.application.bot_data["database"]
+    )
+
+    if update.effective_user:
+        await database.record_user(
+            update.effective_user,
+            chat_id,
+            "button",
+        )
 
     if action == callbacks.NOOP:
         return
@@ -55,6 +72,7 @@ async def callback_router(
         await query.message.reply_text(
             "Search cancelled."
         )
+
         return
 
     if action == callbacks.SOURCE and value:
@@ -63,7 +81,12 @@ async def callback_router(
             value,
             store,
             query.message,
+            database,
+            update.effective_user.id
+            if update.effective_user
+            else None,
         )
+
         return
 
     if action == callbacks.SELECT and value:
@@ -73,6 +96,7 @@ async def callback_router(
             store,
             query.message,
         )
+
         return
 
     if action == callbacks.CHAPTERS:
@@ -82,29 +106,42 @@ async def callback_router(
             store,
             query.message,
         )
+
         return
 
-    if action == callbacks.BACK and value == "source":
+    if (
+        action == callbacks.BACK
+        and value == "source"
+    ):
         await query.message.reply_text(
             "Select a source to search:",
             reply_markup=source_picker(),
         )
+
         return
 
-    if action == callbacks.BACK and value == "results":
+    if (
+        action == callbacks.BACK
+        and value == "results"
+    ):
         await show_results(
             chat_id,
             store,
             query.message,
         )
+
         return
 
-    if action == callbacks.BACK and value == "manga":
+    if (
+        action == callbacks.BACK
+        and value == "manga"
+    ):
         await show_selected_manga(
             chat_id,
             store,
             query.message,
         )
+
         return
 
 
@@ -113,6 +150,8 @@ async def search_from_source(
     source_value: str,
     store: SessionStore,
     message: object,
+    database: MongoDatabase,
+    user_id: int | None,
 ) -> None:
     session = store.get(chat_id)
 
@@ -121,16 +160,17 @@ async def search_from_source(
             "Your search expired. "
             "Please send /search again."
         )
+
         return
 
-    source_name = (
+    search_label = (
         "all 3 sources"
         if source_value == "all"
         else source_value
     )
 
     await message.reply_text(
-        f"🔎 Searching {source_name} "
+        f"🔎 Searching {search_label} "
         f"for: {session.query}"
     )
 
@@ -139,8 +179,11 @@ async def search_from_source(
             session.results = await search_all(
                 session.query
             )
+
         else:
-            if source_value not in (
+            source_id = source_value
+
+            if source_id not in (
                 "kaliscan",
                 "comick",
                 "mangadex",
@@ -150,8 +193,19 @@ async def search_from_source(
                 )
 
             session.results = await search_one(
-                source_value,
+                source_id,
                 session.query,
+            )
+
+        if user_id is not None:
+            await database.record_search(
+                telegram_user_id=user_id,
+                chat_id=chat_id,
+                search_query=session.query,
+                source=source_value,
+                result_count=len(
+                    session.results
+                ),
             )
 
     except Exception as error:
@@ -164,18 +218,21 @@ async def search_from_source(
         session.results = []
 
         await message.reply_text(
-            "That source is temporarily unavailable. "
-            "Try another source.",
+            "That source is temporarily "
+            "unavailable. Try another source.",
             reply_markup=source_picker(),
         )
+
         return
 
     if not session.results:
         await message.reply_text(
-            f"No results found for: {session.query}\n\n"
+            f"No results found for: "
+            f"{session.query}\n\n"
             "Try another source or a shorter title.",
             reply_markup=source_picker(),
         )
+
         return
 
     await message.reply_text(
@@ -197,11 +254,17 @@ async def select_result(
 
     try:
         manga = (
-            session.results[int(index_value)]
+            session.results[
+                int(index_value)
+            ]
             if session
             else None
         )
-    except (IndexError, ValueError):
+
+    except (
+        IndexError,
+        ValueError,
+    ):
         manga = None
 
     if not session or not manga:
@@ -209,6 +272,7 @@ async def select_result(
             "That result expired. "
             "Please send /search again."
         )
+
         return
 
     session.select(manga)
@@ -229,8 +293,10 @@ async def show_selected_manga(
 
     if not session or not session.has_selection:
         await message.reply_text(
-            "Please start with /search <title>."
+            "Please start with "
+            "/search <title>."
         )
+
         return
 
     source = get_source(
@@ -241,6 +307,7 @@ async def show_selected_manga(
         manga = await source.get_manga(
             session.selected_id or ""
         )
+
     except Exception as error:
         logger.warning(
             "Manga detail lookup failed: %s",
@@ -248,19 +315,18 @@ async def show_selected_manga(
         )
 
         await message.reply_text(
-            f"{source.label} could not load that title. "
-            "Try another result or source.",
+            f"{source.label} could not load "
+            "that title. Try another result "
+            "or source.",
             reply_markup=result_list(
                 session.results
             ),
         )
+
         return
 
     caption = manga_message(manga)
-
-    keyboard = manga_actions_with_url(
-        manga
-    )
+    keyboard = manga_actions_with_url(manga)
 
     if manga.cover_url:
         try:
@@ -269,7 +335,9 @@ async def show_selected_manga(
                 caption=caption[:1024],
                 reply_markup=keyboard,
             )
+
             return
+
         except TelegramError as error:
             logger.warning(
                 "Cover could not be sent: %s",
@@ -292,8 +360,10 @@ async def show_chapters(
 
     if not session or not session.has_selection:
         await message.reply_text(
-            "Please start with /search <title>."
+            "Please start with "
+            "/search <title>."
         )
+
         return
 
     source = get_source(
@@ -307,6 +377,7 @@ async def show_chapters(
                 session.selected_id or "",
             )
         )
+
     except Exception as error:
         logger.warning(
             "Chapter lookup failed: %s",
@@ -314,29 +385,34 @@ async def show_chapters(
         )
 
         await message.reply_text(
-            f"{source.label} could not load chapters "
-            "for this title. Try another source.",
+            f"{source.label} could not load "
+            "chapters for this title. "
+            "Try another source.",
             reply_markup=result_list(
                 session.results
             ),
         )
+
         return
 
     if not chapters:
         await message.reply_text(
-            f"No chapter links are available for "
-            f"{manga.title} on {source.label}.",
+            f"No chapter links are available "
+            f"for {manga.title} on "
+            f"{source.label}.",
             reply_markup=manga_actions_with_url(
                 manga
             ),
         )
+
         return
 
     await message.reply_text(
         f"📚 {manga.title}\n\n"
-        f"{len(chapters)} chapters found on "
-        f"{source.label}.\n"
-        "Select a chapter to open it on the source site.",
+        f"{len(chapters)} chapters found "
+        f"on {source.label}.\n"
+        "Select a chapter to open it on "
+        "the source site.",
         reply_markup=chapter_list(
             chapters,
             page,
@@ -348,6 +424,8 @@ async def gather_manga_and_chapters(
     source: object,
     manga_id: str,
 ) -> tuple[Manga, list]:
+    import asyncio
+
     manga, chapters = await asyncio.gather(
         source.get_manga(manga_id),
         source.get_chapters(manga_id),
@@ -368,10 +446,12 @@ async def show_results(
             "Your search expired. "
             "Please send /search again."
         )
+
         return
 
     await message.reply_text(
-        f"📚 Results for: {session.query}\n\n"
+        f"📚 Results for: "
+        f"{session.query}\n\n"
         "Select a title to view details:",
         reply_markup=result_list(
             session.results
@@ -379,11 +459,14 @@ async def show_results(
     )
 
 
-def manga_message(manga: Manga) -> str:
+def manga_message(
+    manga: Manga,
+) -> str:
     metadata = [
         f"Source: {manga.source.title()}",
         (
-            f"Also known as: {manga.alternative_title}"
+            f"Also known as: "
+            f"{manga.alternative_title}"
             if manga.alternative_title
             else None
         ),
@@ -393,17 +476,20 @@ def manga_message(manga: Manga) -> str:
             else None
         ),
         (
-            f"Author: {', '.join(manga.authors)}"
+            f"Author: "
+            f"{', '.join(manga.authors)}"
             if manga.authors
             else None
         ),
         (
-            f"Genres: {', '.join(manga.genres[:5])}"
+            f"Genres: "
+            f"{', '.join(manga.genres[:5])}"
             if manga.genres
             else None
         ),
         (
-            f"Chapters listed: {manga.chapter_count}"
+            f"Chapters listed: "
+            f"{manga.chapter_count}"
             if manga.chapter_count
             else None
         ),
@@ -429,8 +515,10 @@ def manga_message(manga: Manga) -> str:
                 if part
             ),
             description,
-            "Select Chapters to browse "
-            "available releases.",
+            (
+                "Select Chapters to browse "
+                "available releases."
+            ),
         ]
         if part
     )
@@ -448,8 +536,12 @@ def int_or_zero(
 def register_callback_handlers(
     application: object,
 ) -> None:
-    from telegram.ext import CallbackQueryHandler
+    from telegram.ext import (
+        CallbackQueryHandler,
+    )
 
     application.add_handler(
-        CallbackQueryHandler(callback_router)
-      )
+        CallbackQueryHandler(
+            callback_router
+        )
+    )
