@@ -115,7 +115,7 @@ class MongoDatabase:
         chat_id: int | None = None,
         last_action: str | None = None,
     ) -> None:
-        if not self.db or not user:
+        if self.db is None or user is None:
             return
 
         now = utc_now()
@@ -150,7 +150,7 @@ class MongoDatabase:
         source: str,
         result_count: int,
     ) -> None:
-        if not self.db:
+        if self.db is None:
             return
 
         await self.db.searches.insert_one(
@@ -167,7 +167,7 @@ class MongoDatabase:
         )
 
     async def stats(self) -> dict[str, int]:
-        if not self.db:
+        if self.db is None:
             return {
                 "users": 0,
                 "searches": 0,
@@ -180,4 +180,4 @@ class MongoDatabase:
             "searches": await self.db.searches.count_documents(
                 {}
             ),
-      }
+        }
